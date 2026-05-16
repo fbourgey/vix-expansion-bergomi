@@ -56,6 +56,36 @@ def test_one_factor_bergomi_model_defaults_rho_to_negative_half():
 
 
 @pytest.mark.parametrize(
+    ("model_cls", "params", "match"),
+    [
+        (RoughBergomiModel, {"eta": 0.0, "H": 0.3}, "eta"),
+        (RoughBergomiModel, {"eta": 1.4, "H": 1.0}, "H"),
+        (RoughBergomiModel, {"eta": 1.4, "H": 0.3, "rho": -1.1}, "rho"),
+        (OneFactorBergomiModel, {"w": 0.0, "k": 1.0}, "w"),
+        (OneFactorBergomiModel, {"w": 4.0, "k": -0.1}, "k"),
+        (OneFactorBergomiModel, {"w": 4.0, "k": 1.0, "rho": 1.1}, "rho"),
+    ],
+)
+def test_model_constructors_validate_public_parameters(model_cls, params, match):
+    with pytest.raises(ValueError, match=match):
+        model_cls(s0=1.0, xi0=flat_xi0(), params=params)
+
+
+@pytest.mark.parametrize(
+    ("id", "expected_params"),
+    [
+        (1, {"w": pytest.approx(2.0), "k": pytest.approx(0.25)}),
+        (2, {"w": pytest.approx(8.0), "k": pytest.approx(10.0)}),
+    ],
+)
+def test_one_factor_single_params_are_defined_for_supported_ids(id, expected_params):
+    params, xi0 = get_params_one_bergomi(id=id, opt="single")
+
+    assert params == expected_params
+    assert xi0(np.array([0.0, 0.25])) == pytest.approx(np.array([0.24**2, 0.24**2]))
+
+
+@pytest.mark.parametrize(
     ("id", "xi0_level", "w_1", "w_2", "lbd"),
     [
         (3, 1.445e-2, 6.1970, 0.6586, 0.3021),
@@ -74,6 +104,22 @@ def test_one_factor_mixed_term_bucket_params(id, xi0_level, w_1, w_2, lbd):
     assert xi0(np.array([0.0, 0.25])) == pytest.approx(np.array([xi0_level, xi0_level]))
     assert actual_w_2 == pytest.approx(w_2)
     assert actual_lbd == pytest.approx(lbd)
+
+
+@pytest.mark.parametrize(
+    ("id", "h", "eta", "rho"),
+    [
+        (1, 0.1, 1.0, -0.7),
+        (2, 0.23, 1.02, -0.5),
+    ],
+)
+def test_rough_single_params_are_defined_for_supported_ids(id, h, eta, rho):
+    params, xi0 = get_params_rbergomi(id=id, opt="single")
+
+    assert params["H"] == pytest.approx(h)
+    assert params["eta"] == pytest.approx(eta / np.sqrt(2 * h))
+    assert params.get("rho", -0.5) == pytest.approx(rho)
+    assert xi0(np.array([0.0, 0.25])) == pytest.approx(np.array([0.24**2, 0.24**2]))
 
 
 @pytest.mark.parametrize(
@@ -96,6 +142,21 @@ def test_rough_mixed_params_are_defined_for_supported_ids(id, h, eta, eta_2, lbd
 def test_rough_mixed_params_reject_unsupported_ids(id):
     with pytest.raises(ValueError, match="Must be 1 or 2"):
         get_params_rbergomi(id=id, opt="mixed")
+
+
+@pytest.mark.parametrize(
+    ("factory", "kwargs", "match"),
+    [
+        (get_params_one_bergomi, {"id": 1, "opt": "bad"}, "Invalid opt"),
+        (get_params_one_bergomi, {"id": 3, "opt": "single"}, "single case"),
+        (get_params_one_bergomi, {"id": 7, "opt": "mixed"}, "mixed case"),
+        (get_params_rbergomi, {"id": 1, "opt": "bad"}, "Invalid opt"),
+        (get_params_rbergomi, {"id": 3, "opt": "single"}, "single case"),
+    ],
+)
+def test_parameter_helpers_reject_invalid_public_inputs(factory, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        factory(**kwargs)
 
 
 @pytest.mark.parametrize("volvol_2", [0.0, -0.1])
@@ -144,6 +205,28 @@ def test_implied_vol_vix_approx_mixed_reuses_precomputed_params(monkeypatch):
 
     assert impvol.shape == (3,)
     assert call_count == 1
+
+
+def test_implied_vol_vix_approx_mixed_return_all_includes_future_and_impvol():
+    model = RoughBergomiModel(
+        s0=1.0,
+        xi0=flat_xi0(),
+        params={"eta": 1.4, "H": 0.3, "rho": -0.7},
+    )
+
+    future, impvol = model.implied_vol_vix_approx_mixed(
+        T=0.25,
+        k=np.array([-0.1, 0.0, 0.1]),
+        order=0,
+        lbd=0.5,
+        volvol_2=1.2,
+        n_quad=12,
+        return_opt="all",
+    )
+
+    assert future > 0
+    assert impvol.shape == (3,)
+    assert np.all(np.isfinite(impvol))
 
 
 def test_vix_approx_future_wrappers_are_consistent():
@@ -314,6 +397,37 @@ def test_one_factor_mixed_approximation_collapses_to_single_future():
     )
 
     assert mixed_future == pytest.approx(single_future, abs=1e-12)
+
+
+def test_one_factor_mixed_approximation_collapses_to_single_put():
+    model = OneFactorBergomiModel(
+        s0=1.0,
+        xi0=flat_xi0(0.24**2),
+        params={"w": 4.0, "k": 1.0, "rho": -0.7},
+    )
+    T = 0.25
+    log_moneyness = -0.1
+    n_quad = 120
+
+    single_future = model.price_vix_fut_approx(T=T, order=3, n_quad=n_quad)
+    single_put = model.price_vix_approx(
+        k=log_moneyness,
+        T=T,
+        opttype=-1,
+        order=3,
+        n_quad=n_quad,
+    )
+    mixed_put = model.price_vix_approx_mixed(
+        T=T,
+        lbd=0.35,
+        volvol_2=4.0,
+        opt_payoff="put",
+        order=3,
+        n_quad=n_quad,
+        K=single_future * np.exp(log_moneyness),
+    )
+
+    assert mixed_put == pytest.approx(single_put, abs=2e-5)
 
 
 def test_one_factor_mixed_approximation_collapses_to_single_call():
@@ -529,3 +643,16 @@ def test_price_vix_control_variate_accepts_vector_opttype():
 
     assert price.shape == (2,)
     assert np.all(np.isfinite(price))
+
+
+def test_price_vix_control_variate_return_fut_is_positive_scalar():
+    model = RoughBergomiModel(
+        s0=1.0,
+        xi0=flat_xi0(),
+        params={"eta": 1.4, "H": 0.3, "rho": -0.7},
+    )
+
+    future = model.price_vix_control_variate(T=0.25, n_disc=12, return_fut=True)
+
+    assert np.isscalar(future)
+    assert future > 0
